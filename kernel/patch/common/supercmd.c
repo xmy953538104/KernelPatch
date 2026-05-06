@@ -330,10 +330,8 @@ void handle_supercmd(char **__user u_filename_p, char **__user uargv)
 {
     int is_key_auth = 0;
     int is_trusted_manager = 0;
-    is_trusted_manager = is_trusted_manager_uid(current_uid());
-    if (is_trusted_manager) {
-        is_key_auth = 1;
-    }
+    uid_t uid = current_uid();
+    is_trusted_manager = is_trusted_manager_uid(uid);
     // key
     const char __user *p1 = get_user_arg_ptr(0, *uargv, 1);
     if (!p1 || IS_ERR(p1)) return;
@@ -344,10 +342,19 @@ void handle_supercmd(char **__user u_filename_p, char **__user uargv)
     char arg1[SUPER_KEY_LEN];
     if (compat_strncpy_from_user(arg1, p1, sizeof(arg1)) <= 0) return;
 
+#ifdef ANDROID
+    if (!is_trusted_manager && !strcmp("su", arg1)) {
+        refresh_trusted_manager_state();
+        is_trusted_manager = is_trusted_manager_uid(uid);
+    }
+#endif
+    if (is_trusted_manager) {
+        is_key_auth = 1;
+    }
+
     if (!auth_superkey(arg1)) {
         is_key_auth = 1;
     } else if (!strcmp("su", arg1)) {
-        uid_t uid = current_uid();
         if (!is_su_allow_uid(uid) && !is_trusted_manager) return;
         su_allow_uid_profile(0, uid, &profile);
     } else {

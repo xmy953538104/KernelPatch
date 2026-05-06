@@ -862,6 +862,170 @@ out_free:
     return rc;
 }
 
+static bool xml_path_ends_with_apk(const char *path, size_t len)
+{
+    return len >= 4 && memcmp(path + len - 4, ".apk", 4) == 0;
+}
+
+static char *find_xml_attr_value(char *tag_start,
+                                 char *tag_end,
+                                 const char *attr,
+                                 size_t *value_len)
+{
+    char *cp;
+    char *end;
+
+    if (!tag_start || !attr || !value_len)
+        return NULL;
+
+    cp = strstr(tag_start, attr);
+    if (!cp || (tag_end && cp > tag_end))
+        return NULL;
+
+    cp += strlen(attr);
+    end = strchr(cp, '"');
+    if (!end || (tag_end && end > tag_end))
+        return NULL;
+
+    *value_len = end - cp;
+    return cp;
+}
+
+static int copy_xml_apk_path(const char *path,
+                             size_t path_len,
+                             char *apk_path,
+                             size_t apk_path_len,
+                             bool append_base_apk)
+{
+    static const char base_apk[] = "/base.apk";
+    size_t suffix_len = append_base_apk ? strlen(base_apk) : 0;
+
+    if (path_len + suffix_len >= apk_path_len)
+        return -ENOSPC;
+
+    memcpy(apk_path, path, path_len);
+    if (append_base_apk) {
+        memcpy(apk_path + path_len, base_apk, suffix_len + 1);
+    } else {
+        apk_path[path_len] = '\0';
+    }
+
+    return 0;
+}
+
+struct xml_apk_file_ctx {
+    struct dir_context dctx;
+    const char *dir_path;
+    char *result;
+    size_t result_len;
+    int found;
+};
+
+static int xml_try_apk_dir_entry(struct xml_apk_file_ctx *ctx,
+                                 const char *name,
+                                 int namelen)
+{
+    size_t dir_len;
+    size_t path_len;
+    int need_slash;
+
+    if (!ctx || !ctx->dir_path || !ctx->result || ctx->found)
+        return ctx && ctx->found;
+
+    if (namelen <= 4 || memcmp(name + namelen - 4, ".apk", 4) != 0)
+        return 0;
+
+    dir_len = strlen(ctx->dir_path);
+    need_slash = dir_len > 0 && ctx->dir_path[dir_len - 1] != '/';
+    path_len = dir_len + (need_slash ? 1 : 0) + namelen + 1;
+
+    if (path_len > ctx->result_len)
+        return 0;
+
+    memcpy(ctx->result, ctx->dir_path, dir_len);
+    if (need_slash)
+        ctx->result[dir_len++] = '/';
+    memcpy(ctx->result + dir_len, name, namelen);
+    ctx->result[dir_len + namelen] = '\0';
+
+    ctx->found = 1;
+    return 1;
+}
+
+static bool xml_apk_file_actor(struct dir_context *dctx,
+                               const char *name, int namelen,
+                               loff_t offset, u64 ino, unsigned int d_type)
+{
+    struct xml_apk_file_ctx *ctx =
+        container_of(dctx, struct xml_apk_file_ctx, dctx);
+
+    return !xml_try_apk_dir_entry(ctx, name, namelen);
+}
+
+static int xml_apk_file_actor_int(struct dir_context *dctx,
+                                  const char *name, int namelen,
+                                  loff_t offset, u64 ino, unsigned int d_type)
+{
+    struct xml_apk_file_ctx *ctx =
+        container_of(dctx, struct xml_apk_file_ctx, dctx);
+
+    return xml_try_apk_dir_entry(ctx, name, namelen);
+}
+
+static int find_apk_in_xml_code_path_dir(const char *path,
+                                         size_t path_len,
+                                         char *apk_path,
+                                         size_t apk_path_len)
+{
+    struct xml_apk_file_ctx ctx;
+    struct file *dir;
+    char *dir_path;
+    int rc = -ENOENT;
+
+    if (!path || !apk_path || path_len == 0)
+        return -EINVAL;
+
+    dir_path = vmalloc(path_len + 1);
+    if (!dir_path)
+        return -ENOMEM;
+
+    memcpy(dir_path, path, path_len);
+    dir_path[path_len] = '\0';
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.dir_path = dir_path;
+    ctx.result = apk_path;
+    ctx.result_len = apk_path_len;
+    ctx.dctx.pos = 0;
+    if (kver >= VERSION(6, 1, 0)) {
+        ctx.dctx.actor = xml_apk_file_actor;
+    } else {
+        ctx.dctx.actor = xml_apk_file_actor_int;
+    }
+
+    set_priv_sel_allow(current, true);
+    dir = filp_open(dir_path, O_RDONLY | O_NOFOLLOW, 0);
+    if (IS_ERR(dir)) {
+        log_boot("open xml codePath dir failed: %s rc=%ld\n",
+                 dir_path, PTR_ERR(dir));
+        set_priv_sel_allow(current, false);
+        vfree(dir_path);
+        return -ENOENT;
+    }
+
+    iterate_dir(dir, &ctx.dctx);
+    filp_close(dir, 0);
+    set_priv_sel_allow(current, false);
+
+    if (ctx.found) {
+        log_boot("apk found (xml codePath dir): %s\n", apk_path);
+        rc = 0;
+    }
+
+    vfree(dir_path);
+    return rc;
+}
+
 static int find_apk_from_packages_xml(const char *pkg,
                                       char *apk_path,
                                       size_t apk_path_len)
@@ -891,29 +1055,46 @@ static int find_apk_from_packages_xml(const char *pkg,
             p += strlen(pkg);
             continue;
         }
-        char *cp = strstr(start, "codePath=\"");
+        char *tag_end = strchr(start, '>');
+        char *cp;
+        size_t l;
+
+        cp = find_xml_attr_value(start, tag_end, "resourcePath=\"", &l);
+        if (cp && xml_path_ends_with_apk(cp, l)) {
+            rc = copy_xml_apk_path(cp, l, apk_path, apk_path_len, false);
+            if (rc)
+                goto out;
+
+            log_boot("apk found (xml resourcePath): %s\n", apk_path);
+
+            rc = 0;
+            goto out;
+        }
+
+        cp = find_xml_attr_value(start, tag_end, "codePath=\"", &l);
         if (!cp) {
             p += strlen(pkg);
             continue;
         }
 
-        cp += strlen("codePath=\"");
+        if (xml_path_ends_with_apk(cp, l)) {
+            rc = copy_xml_apk_path(cp, l, apk_path, apk_path_len, false);
+            if (rc)
+                goto out;
 
-        char *end = strchr(cp, '"');
-        if (!end) {
-            p += strlen(pkg);
-            continue;
-        }
+            log_boot("apk found (xml codePath): %s\n", apk_path);
 
-        size_t l = end - cp;
-
-        if (l + strlen("/base.apk") >= apk_path_len) {
-            rc = -ENOSPC;
+            rc = 0;
             goto out;
         }
 
-        memcpy(apk_path, cp, l);
-        memcpy(apk_path + l, "/base.apk", strlen("/base.apk") + 1);
+        rc = find_apk_in_xml_code_path_dir(cp, l, apk_path, apk_path_len);
+        if (!rc)
+            goto out;
+
+        rc = copy_xml_apk_path(cp, l, apk_path, apk_path_len, true);
+        if (rc)
+            goto out;
 
         log_boot("apk found (xml): %s\n", apk_path);
 

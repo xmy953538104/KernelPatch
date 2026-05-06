@@ -387,6 +387,19 @@ int is_trusted_manager_uid(uid_t uid)
     return 0;
 }
 
+static int refresh_and_check_trusted_manager_uid(uid_t uid)
+{
+#ifdef ANDROID
+    if (is_trusted_manager_uid(uid))
+        return 1;
+
+    refresh_trusted_manager_state();
+    return is_trusted_manager_uid(uid);
+#else
+    return is_trusted_manager_uid(uid);
+#endif
+}
+
 static void before(hook_fargs6_t *args, void *udata)
 {
     int uid = current_uid();
@@ -403,7 +416,7 @@ static void before(hook_fargs6_t *args, void *udata)
         is_authed = !auth_superkey(key);
         is_trusted_caller = is_authed;
     }
-    if (is_trusted_manager_uid(uid)) {
+    if (refresh_and_check_trusted_manager_uid(uid)) {
         is_trusted_caller = 1;
         is_authed = 1;
     } else if (is_su_allow_uid(uid)) {
