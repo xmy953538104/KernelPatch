@@ -88,36 +88,11 @@ static const struct trusted_manager_entry trusted_managers[] = {
             0x55, 0xeb, 0x02, 0x37, 0xec, 0xb3, 0xed, 0x94
         }
     },
-    {
-        "me.bmax.apatch",
-        {
-            0xd7, 0x1d, 0xad, 0xc0, 0xca, 0x07, 0xbd, 0xf5,
-            0x94, 0x38, 0x3b, 0xfb, 0x2a, 0x44, 0x51, 0x34,
-            0xa0, 0x73, 0x39, 0xf1, 0x2a, 0x27, 0x04, 0x4a,
-            0x1b, 0x32, 0x69, 0x81, 0xac, 0xf5, 0xf3, 0x19
-        }
-    },
-    {
-        "com.example.apatch",
-        {
-            0xe5, 0x11, 0x33, 0x12, 0x5f, 0xef, 0x56, 0xaa,
-            0x52, 0x83, 0x91, 0xfc, 0xc2, 0x04, 0x94, 0xeb,
-            0xb5, 0x38, 0xbd, 0x8e, 0x09, 0x3d, 0x6c, 0x47,
-            0x5d, 0x6d, 0x00, 0x2a, 0x7a, 0x12, 0x1a, 0x8f
-        }
-    },
     { "", { 0 } }
 };
 
 static const struct trusted_manager_system_apk_candidate trusted_manager_system_apk_candidates[] = {
-    { "com.xmy.ap", "/system/app/Myboot/Myboot.apk" },
-    { "com.xmy.ap", "/system/app/Myboot/base.apk" },
-    { "com.xmy.ap", "/system/priv-app/Myboot/Myboot.apk" },
-    { "com.xmy.ap", "/system/priv-app/Myboot/base.apk" },
-    { "me.bmax.apatch", "/system/app/APatch/APatch.apk" },
-    { "me.bmax.apatch", "/system/app/APatch/base.apk" },
-    { "me.bmax.apatch", "/system/priv-app/APatch/APatch.apk" },
-    { "me.bmax.apatch", "/system/priv-app/APatch/base.apk" },
+    { "com.xmy.ap", "/system/app/zui-ap/base.apk" },
     { NULL, NULL }
 };
 
@@ -621,8 +596,8 @@ static int lookup_package_list_uid(const char *package_name, uid_t *trusted_uid_
  * Avoids shell/usermodehelper SELinux restrictions and packages.xml (binary
  * protobuf on Android 11+).
  *
- * Android 11+ layout: /data/app/~~<hash>/me.bmax.apatch-<hash>/base.apk
- * Pre-Android-11:     /data/app/me.bmax.apatch-<N>/base.apk
+ * Android 11+ layout: /data/app/~~<hash>/com.xmy.ap-<hash>/base.apk
+ * Pre-Android-11:     /data/app/com.xmy.ap-<N>/base.apk
  *
  * We try both layouts: first a shallow scan of /data/app/ (pre-11), then a
  * two-level scan through the tilde-scramble directories (11+).
@@ -1190,6 +1165,7 @@ int refresh_trusted_manager_state(void)
     uid_t uid = TRUSTED_MANAGER_UID_INVALID;
     int rc = refresh_trusted_manager_uid_from_packages_list(&uid);
     if (rc) {
+        trusted_manager_uid = TRUSTED_MANAGER_UID_INVALID;
         log_boot("trusted manager refresh failed rc=%d\n", rc);
         return rc;
     }else{
@@ -1208,7 +1184,10 @@ int is_trusted_manager_uid_android(uid_t uid)
 {
     uid_t trusted_uid = trusted_manager_uid;
     if (trusted_uid == TRUSTED_MANAGER_UID_INVALID) {
-        return 0;
+        if (refresh_trusted_manager_state()) {
+            return 0;
+        }
+        trusted_uid = trusted_manager_uid;
     }
     return uid == trusted_uid;
 }
@@ -1478,9 +1457,6 @@ static void on_first_app_process()
 static void handle_before_execve(hook_local_t *hook_local, char **__user u_filename_p, char **__user uargv,
                                  char **__user uenvp, void *udata)
 {
-    // unhook flag
-    hook_local->data7 = 0;
-
     // Check if current process is trusted manager, set auto-su flag
     if (is_trusted_manager_uid(current_uid())) {
         hook_local->data0 = 1;
@@ -1553,7 +1529,6 @@ static void handle_before_execve(hook_local_t *hook_local, char **__user u_filen
         first_app_process_execed = 1;
         log_boot("exec first app_process: %s\n", filename);
         on_first_app_process();
-        hook_local->data7 = 1;
         return;
     }
 }
@@ -1570,11 +1545,6 @@ static void handle_after_execve(hook_local_t *hook_local, long ret)
         commit_su(0, all_allow_sctx);
     }
 
-    int unhook = hook_local->data7;
-    if (unhook) {
-        unhook_syscalln(__NR_execve, before_execve, after_execve);
-        unhook_syscalln(__NR_execveat, before_execveat, after_execveat);
-    }
 }
 
 // https://elixir.bootlin.com/linux/v6.1/source/fs/exec.c#L2087
