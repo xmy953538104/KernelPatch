@@ -71,9 +71,14 @@ struct trusted_manager_entry {
     const uint8_t digest[TRUSTED_MANAGER_DIGEST_LEN];
 };
 
+struct trusted_manager_system_apk_candidate {
+    const char *package;
+    const char *path;
+};
+
 static const struct trusted_manager_entry trusted_managers[] = {
     {
-        // Mync (xmy953538104 fork) - SHA256 of APK v2 signing cert (DER)
+        // Myboot (xmy953538104 fork) - SHA256 of APK v2 signing cert (DER)
         // base64: P+zzpyyg4PJJkdSecwbvSnEXEfSKZgcHVesCN+yz7ZQ=
         "com.xmy.ap",
         {
@@ -104,6 +109,18 @@ static const struct trusted_manager_entry trusted_managers[] = {
     { "", { 0 } }
 };
 
+static const struct trusted_manager_system_apk_candidate trusted_manager_system_apk_candidates[] = {
+    { "com.xmy.ap", "/system/app/Myboot/Myboot.apk" },
+    { "com.xmy.ap", "/system/app/Myboot/base.apk" },
+    { "com.xmy.ap", "/system/priv-app/Myboot/Myboot.apk" },
+    { "com.xmy.ap", "/system/priv-app/Myboot/base.apk" },
+    { "me.bmax.apatch", "/system/app/APatch/APatch.apk" },
+    { "me.bmax.apatch", "/system/app/APatch/base.apk" },
+    { "me.bmax.apatch", "/system/priv-app/APatch/APatch.apk" },
+    { "me.bmax.apatch", "/system/priv-app/APatch/base.apk" },
+    { NULL, NULL }
+};
+
 static uid_t trusted_manager_uid = TRUSTED_MANAGER_UID_INVALID;
 static int global_pkg_pos = 0;
 
@@ -118,20 +135,20 @@ static const char ORIGIN_RC_FILES[][64] = {
 static const char user_rc_data[] = { //
     "\n"
     "on early-init\n"
-    "    exec -- " SUPERCMD " %s event early-init before\n"
+    "    exec -- " SUPERCMD " su event early-init before\n"
     "on init\n"
-    "    exec -- " SUPERCMD " %s event init before\n"
+    "    exec -- " SUPERCMD " su event init before\n"
     "on late-init\n"
-    "    exec -- " SUPERCMD " %s event late-init before\n"
+    "    exec -- " SUPERCMD " su event late-init before\n"
     "on post-fs-data\n"
     "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " MAGISK_POLICY_PATH " --magisk --live\n"
-    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " -s %s post-fs-data\n"
+    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " post-fs-data\n"
     "on nonencrypted\n"
-    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " -s %s services\n"
+    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " services\n"
     "on property:vold.decrypt=trigger_restart_framework\n"
-    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " -s %s services\n"
+    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " services\n"
     "on property:sys.boot_completed=1\n"
-    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " -s %s boot-completed\n"
+    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " boot-completed\n"
     "    exec -- " SUPERCMD " su event boot-completed\n"
     "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " uid-listener &\n"
     "    rm " REPLACE_RC_FILE "\n"
@@ -166,6 +183,37 @@ out:
     return data;
 }
 
+static int kernel_file_exists(const char *path)
+{
+    struct file *fp;
+
+    if (!path || !path[0])
+        return 0;
+
+    set_priv_sel_allow(current, true);
+    fp = filp_open(path, O_RDONLY | O_NOFOLLOW, 0);
+    if (!fp || IS_ERR(fp)) {
+        set_priv_sel_allow(current, false);
+        return 0;
+    }
+
+    filp_close(fp, 0);
+    set_priv_sel_allow(current, false);
+    return 1;
+}
+
+static int copy_path(char *dst, size_t dst_len, const char *src, size_t src_len)
+{
+    if (!dst || !src || dst_len == 0)
+        return -EINVAL;
+    if (src_len + 1 > dst_len)
+        return -ENOSPC;
+
+    memcpy(dst, src, src_len);
+    dst[src_len] = '\0';
+    return 0;
+}
+
 static int path_has_suffix(const char *path, const char *suffix)
 {
     size_t path_len;
@@ -180,6 +228,70 @@ static int path_has_suffix(const char *path, const char *suffix)
 static int path_is_exact(const char *path, const char *target)
 {
     return path && target && strcmp(path, target) == 0;
+}
+
+static int xml_attr_value(const char *start, const char *end, const char *attr,
+                          const char **value, size_t *value_len)
+{
+    const char *p;
+    size_t attr_len;
+
+    if (!start || !end || !attr || !value || !value_len || start >= end)
+        return 0;
+
+    attr_len = strlen(attr);
+    p = start;
+
+    while (p && p < end) {
+        const char *q;
+
+        p = strstr(p, attr);
+        if (!p || p >= end)
+            return 0;
+
+        p += attr_len;
+        q = p;
+        while (q < end && *q != '"')
+            q++;
+
+        if (q >= end)
+            return 0;
+
+        *value = p;
+        *value_len = q - p;
+        return 1;
+    }
+
+    return 0;
+}
+
+static int copy_named_apk_from_dir(char *dst, size_t dst_len, const char *dir, size_t dir_len)
+{
+    const char *name;
+    size_t name_len;
+    size_t need_len;
+    static const char apk_suffix[] = ".apk";
+
+    if (!dst || !dir || dir_len == 0)
+        return -EINVAL;
+
+    name = dir + dir_len;
+    while (name > dir && *(name - 1) != '/')
+        name--;
+    name_len = dir + dir_len - name;
+    if (name_len == 0)
+        return -EINVAL;
+
+    need_len = dir_len + 1 + name_len + sizeof(apk_suffix);
+    if (need_len > dst_len)
+        return -ENOSPC;
+
+    memcpy(dst, dir, dir_len);
+    dst[dir_len] = '/';
+    memcpy(dst + dir_len + 1, name, name_len);
+    memcpy(dst + dir_len + 1 + name_len, apk_suffix, sizeof(apk_suffix));
+
+    return kernel_file_exists(dst) ? 0 : -ENOENT;
 }
 
 static int read_le32(struct file *fp, loff_t *pos, uint32_t *out)
@@ -752,6 +864,43 @@ static int apk_outer_actor_int(struct dir_context *dctx,
     return 0;
 }
 
+static int find_trusted_manager_system_apk_path(char *apk_path,
+                                                size_t apk_path_len,
+                                                int index)
+{
+    int i;
+    const char *package;
+
+    if (!apk_path || apk_path_len == 0)
+        return -EINVAL;
+    if (index < 0 || trusted_managers[index].package[0] == '\0')
+        return -EINVAL;
+
+    package = trusted_managers[index].package;
+    apk_path[0] = '\0';
+
+    for (i = 0; trusted_manager_system_apk_candidates[i].package; i++) {
+        const char *candidate_package = trusted_manager_system_apk_candidates[i].package;
+        const char *candidate_path = trusted_manager_system_apk_candidates[i].path;
+        int rc;
+
+        if (strcmp(candidate_package, package) != 0)
+            continue;
+
+        if (!kernel_file_exists(candidate_path))
+            continue;
+
+        rc = copy_path(apk_path, apk_path_len, candidate_path, strlen(candidate_path));
+        if (rc)
+            return rc;
+
+        log_boot("apk found (system candidate): %s\n", apk_path);
+        return 0;
+    }
+
+    return -ENOENT;
+}
+
 static int find_trusted_manager_apk_path(char *apk_path,
                                          size_t apk_path_len,
                                          int index)
@@ -884,6 +1033,11 @@ static int find_apk_from_packages_xml(const char *pkg,
 
     while ((p = strstr(p, pkg))) {
         char *start = p;
+        char *tag_end;
+        const char *path_value = NULL;
+        size_t path_value_len = 0;
+        int rc_copy;
+
         while (start > data && *start != '<')
             start--;
 
@@ -891,29 +1045,43 @@ static int find_apk_from_packages_xml(const char *pkg,
             p += strlen(pkg);
             continue;
         }
-        char *cp = strstr(start, "codePath=\"");
-        if (!cp) {
+
+        tag_end = strchr(start, '>');
+        if (!tag_end) {
             p += strlen(pkg);
             continue;
         }
 
-        cp += strlen("codePath=\"");
-
-        char *end = strchr(cp, '"');
-        if (!end) {
+        if (!xml_attr_value(start, tag_end, "resourcePath=\"", &path_value, &path_value_len) &&
+            !xml_attr_value(start, tag_end, "baseCodePath=\"", &path_value, &path_value_len) &&
+            !xml_attr_value(start, tag_end, "codePath=\"", &path_value, &path_value_len)) {
             p += strlen(pkg);
             continue;
         }
 
-        size_t l = end - cp;
+        if (path_value_len >= 4 &&
+            memcmp(path_value + path_value_len - 4, ".apk", 4) == 0) {
+            rc_copy = copy_path(apk_path, apk_path_len, path_value, path_value_len);
+        } else {
+            static const char base_apk[] = "/base.apk";
 
-        if (l + strlen("/base.apk") >= apk_path_len) {
-            rc = -ENOSPC;
+            rc_copy = copy_named_apk_from_dir(apk_path, apk_path_len, path_value, path_value_len);
+            if (rc_copy) {
+                if (path_value_len + sizeof(base_apk) > apk_path_len) {
+                    rc = -ENOSPC;
+                    goto out;
+                }
+
+                memcpy(apk_path, path_value, path_value_len);
+                memcpy(apk_path + path_value_len, base_apk, sizeof(base_apk));
+                rc_copy = 0;
+            }
+        }
+
+        if (rc_copy) {
+            rc = rc_copy;
             goto out;
         }
-
-        memcpy(apk_path, cp, l);
-        memcpy(apk_path + l, "/base.apk", strlen("/base.apk") + 1);
 
         log_boot("apk found (xml): %s\n", apk_path);
 
@@ -948,6 +1116,18 @@ static int refresh_trusted_manager_uid_from_packages_list(uid_t *trusted_uid_out
         int rc;
         uid_t uid;
 
+        rc = find_trusted_manager_system_apk_path(
+                apk_path, PATH_MAX,
+                i);
+        if (!rc) {
+            if (apk_matches_trusted_signature(
+                    apk_path, trusted_managers[i].digest)) {
+                goto lookup_uid;
+            }
+
+            log_boot("system apk signature invalid, fallback to package scan: %s\n", apk_path);
+        }
+
         rc = find_trusted_manager_apk_path(
                 apk_path, PATH_MAX,
                 i);
@@ -973,7 +1153,7 @@ static int refresh_trusted_manager_uid_from_packages_list(uid_t *trusted_uid_out
             continue;
         }
 
-
+lookup_uid:
         rc = lookup_package_list_uid(
                 trusted_managers[i].package,
                 &uid);
@@ -1485,8 +1665,7 @@ static void before_openat(hook_fargs4_t *args, void *udata)
     }
 
     char added_rc_data[4096];
-    const char *sk = get_superkey();
-    sprintf(added_rc_data, user_rc_data, sk, sk, sk, sk, sk, sk, sk);
+    snprintf(added_rc_data, sizeof(added_rc_data), "%s", user_rc_data);
 
     kernel_write(newfp, added_rc_data, strlen(added_rc_data), &off);
     if (off != strlen(added_rc_data) + ori_len) {
